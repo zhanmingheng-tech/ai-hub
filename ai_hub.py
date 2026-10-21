@@ -16,6 +16,7 @@ API keys are stored in ~/.ai_hub/config.json in your home directory, never in th
 
 import json
 import os
+import queue
 import threading
 import urllib.error
 import urllib.request
@@ -23,10 +24,17 @@ from pathlib import Path
 import tkinter as tk
 from tkinter import messagebox, scrolledtext, ttk
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 # 配置文件位置（用户主目录） / Config file location (user's home dir)
 CONFIG_DIR = Path.home() / ".ai_hub"
+# 便携模式：若设置了环境变量 AI_HUB_CONFIG_DIR，或脚本旁存在 .ai_hub 文件夹，则使用它
+# Portable mode: use env AI_HUB_CONFIG_DIR, or a `.ai_hub` folder next to this script, if present
+_LOCAL_DIR = Path(__file__).resolve().parent / ".ai_hub"
+if os.environ.get("AI_HUB_CONFIG_DIR"):
+    CONFIG_DIR = Path(os.environ["AI_HUB_CONFIG_DIR"]).expanduser()
+elif _LOCAL_DIR.is_dir():
+    CONFIG_DIR = _LOCAL_DIR
 CONFIG_PATH = CONFIG_DIR / "config.json"
 
 # 内置服务商：名称 -> 默认接口地址和默认模型
@@ -43,6 +51,28 @@ PROVIDERS = {
 }
 
 REQUEST_TIMEOUT = 120  # 秒 / seconds
+GROUP_NAME = "AI Hub 讨论组 / Group Discussion"
+
+
+def build_group_messages(speaker, participants, transcript, group_name=GROUP_NAME):
+    """为某个 AI 构造群聊上下文：自己的发言是 assistant，其他人（用户和其他 AI）是带名字前缀的 user。
+    Build the message list for one AI in group mode: its own turns are `assistant`,
+    everyone else's (user and other AIs) are `user` messages prefixed with the speaker name.
+    transcript: list of (speaker_name, text); the human user is "User"."""
+    others = ", ".join(p for p in participants if p != speaker)
+    system = (f"You are {speaker}, taking part in a group chat named \"{group_name}\". "
+              f"Participants: User (the human), {', '.join(participants)}. "
+              f"Other participants besides you: {others or 'none'}. "
+              "Messages from others are prefixed with '[Name]:'. Read the whole discussion, "
+              "respond to the user and to the other AIs' points (agree, disagree, add), be concise, "
+              "and do not prefix your own reply with your name. Reply in the user's language.")
+    msgs = [{"role": "system", "content": system}]
+    for who, text in transcript:
+        if who == speaker:
+            msgs.append({"role": "assistant", "content": text})
+        else:
+            msgs.append({"role": "user", "content": f"[{who}]: {text}"})
+    return msgs
 
 
 # ---------------------------------------------------------------------------
@@ -218,6 +248,22 @@ class AIHubApp:
         ttk.Button(top, text="Settings / 设置", command=self.open_settings).pack(side="right")
         ttk.Button(top, text="Clear chat / 清空", command=self.clear_chat).pack(side="right", padx=6)
 
+        # 讨论组栏：勾选参与的 AI 与轮数 / Group bar: tick participating AIs and number of rounds
+        group = ttk.Frame(root, padding=(8, 6, 8, 0))
+        group.pack(fill="x")
+        self.group_mode = tk.BooleanVar(value=False)
+        ttk.Checkbutton(group, text="Group / 讨论组:", variable=self.group_mode).pack(side="left")
+        self.member_vars = {}
+        for name in PROVIDERS:
+            v = tk.BooleanVar(value=False)
+            self.member_vars[name] = v
+            ttk.Checkbutton(group, text=name.split(" ")[0], variable=v).pack(side="left", padx=2)
+        self.rounds_var = tk.IntVar(value=1)
+        ttk.Spinbox(group, from_=1, to=3, width=3, textvariable=self.rounds_var,
+                    state="readonly").pack(side="right")
+        ttk.Label(group, text="Rounds / 轮数:").pack(side="right", padx=(6, 2))
+        self.transcript = []  # 讨论组共享记录 [(speaker, text)] / shared group transcript
+
         # 聊天显示区 / Chat display
         self.chat = scrolledtext.ScrolledText(root, wrap="word", state="disabled", font=("TkDefaultFont", 11))
         self.chat.pack(fill="both", expand=True, padx=8, pady=8)
@@ -263,6 +309,7 @@ class AIHubApp:
         if self.busy:
             return
         self.history.clear()
+        self.transcript.clear()
         self.chat.configure(state="normal")
         self.chat.delete("1.0", "end")
         self.chat.configure(state="disabled")
@@ -275,6 +322,8 @@ class AIHubApp:
         text = self.input.get("1.0", "end").strip()
         if not text:
             return
+        if self.group_mode.get():
+            return self.send_group(text)
         name = self.provider_var.get()
         p = self.cfg["providers"][name]
         self.input.delete("1.0", "end")
@@ -305,6 +354,66 @@ class AIHubApp:
             self.history.pop()  # 失败的问题不计入历史 / drop the failed user message
             self.append("error", f"Error / 错误:\n{text}\n\n")
             self.set_busy(False, "Error / 出错")
+
+    # --- 讨论组 / group discussion ---
+    def send_group(self, text):
+        members = [n for n, v in self.member_vars.items() if v.get()]
+        if not members:
+            messagebox.showinfo("AI Hub", "请至少勾选一个 AI / Tick at least one AI.", parent=self.root)
+            return
+        try:
+            rounds = max(1, min(3, int(self.rounds_var.get())))
+        except (ValueError, tk.TclError):
+            rounds = 1
+        self.input.delete("1.0", "end")
+        self.append("user", f"You / 你:\n{text}\n\n")
+        self.transcript.append(("User", text))
+        # 快照配置，线程内不读界面变量 / snapshot config; the thread never touches Tk variables
+        conf = {n: dict(self.cfg["providers"][n]) for n in members}
+        self.set_busy(True, "Group discussion... / 讨论中...")
+        # 后台线程只往队列放结果，主线程轮询队列更新界面
+        # The worker only puts events on a queue; the main thread polls it and updates the UI
+        self.group_q = queue.Queue()
+        threading.Thread(target=self._group_worker, args=(members, conf, rounds), daemon=True).start()
+        self.root.after(50, self._poll_group)
+
+    def _poll_group(self):
+        try:
+            while True:
+                ev = self.group_q.get_nowait()
+                if ev[0] == "status":
+                    self.status.set(ev[1])
+                elif ev[0] == "done":
+                    self.set_busy(False, "Ready / 就绪")
+                    return
+                else:
+                    self._on_group_reply(*ev[1:])
+        except queue.Empty:
+            pass
+        self.root.after(50, self._poll_group)
+
+    def _group_worker(self, members, conf, rounds):
+        # 依次发言；单个 AI 出错不影响其他 AI / speak in turn; one AI's error doesn't stop others
+        transcript = list(self.transcript)
+        for r in range(1, rounds + 1):
+            for name in members:
+                self.group_q.put(("status", f"Round {r}/{rounds}: {name}... / 第{r}轮"))
+                p = conf[name]
+                try:
+                    msgs = build_group_messages(name, members, transcript)
+                    reply = chat_completion(p["base_url"], p["api_key"], p["model"], msgs)
+                    transcript.append((name, reply))
+                    self.group_q.put(("reply", name, r, "ok", reply))
+                except Exception as e:
+                    self.group_q.put(("reply", name, r, "error", str(e)))
+        self.group_q.put(("done",))
+
+    def _on_group_reply(self, name, rnd, kind, text):
+        if kind == "ok":
+            self.transcript.append((name, text))
+            self.append("bot", f"{name} (round {rnd} / 第{rnd}轮):\n{text}\n\n")
+        else:
+            self.append("error", f"{name} error / 错误:\n{text}\n\n")
 
     def set_busy(self, busy, msg):
         self.busy = busy

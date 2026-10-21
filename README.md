@@ -37,9 +37,15 @@ On Windows you can also double-click `ai_hub.py`, or run `py ai_hub.py`.
 
 For **Custom**, enter the base URL up to `/v1` (for example `http://localhost:11434/v1`), the model name, and a key (any non-empty value if your server does not check keys).
 
+## Group discussion (v0.2.0)
+
+Tick **Group** in the second toolbar row, tick the AIs that should join (each needs its key set in Settings), choose **Rounds** (1–3) and send one message. Each selected AI replies in turn in the same window, labeled with its name. Every AI sees the shared transcript: the user's messages and the other AIs' replies (passed as user messages prefixed with `[Name]:`), plus a short system prompt saying it is in a group chat and should respond to the others. If one AI fails, its error is shown and the others continue. Untick **Group** to return to normal single-AI chat.
+
 ## Where is my API key stored?
 
 In `~/.ai_hub/config.json` in your home directory (on Windows: `C:\Users\<you>\.ai_hub\config.json`).
+
+**Portable mode:** if the environment variable `AI_HUB_CONFIG_DIR` is set, that folder is used; otherwise, if a folder named `.ai_hub` exists next to `ai_hub.py`, config is stored there.
 It is stored in plain text, is **never** written into the project folder, and `config.json` is listed in `.gitignore`.
 Do not share this file.
 
