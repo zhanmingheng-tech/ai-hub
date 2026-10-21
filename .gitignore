@@ -1,0 +1,13 @@
+# Local config with API keys - never commit
+config.json
+.ai_hub/
+.env
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+.DS_Store
+Thumbs.db
